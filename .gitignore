@@ -1,0 +1,6 @@
+cmake-build-debug
+libs
+.idea
+src/test.cpp
+
+

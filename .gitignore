@@ -1,6 +1,10 @@
 cmake-build-debug
 libs
 .idea
+.vs
+out
 src/test.cpp
 
+/.vs/
+/out/
 

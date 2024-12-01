@@ -1,31 +1,50 @@
+#include <cstdlib>
 #include <iostream>
-#include <algorithm> // For std::fill
-#include <GL/glut.h>
+#include <string>
+#include <algorithm>
 #include <cmath>
+#include <stack>
+
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
+#include <array>
 
+#include <GL/glut.h>
+#include <GL/gl.h>
 
-////////// PARAMETERS /////////////////////////
-GLint cell_size = 50;
-GLint FPS = 10;
-///////////////////////////////////////////////
+#include <thread>
+#include <atomic>
+#include "conwayutils.h"
+#include "GL/freeglut_ext.h"
 
+GLint cellSize = 50, targetFps = 10;
 GLint ww, wh;
-GLint tickRate = 1'000 / FPS, lastTick = 0;
-bool paused = false;
-bool prev_paused_state = false;
-bool lmb_down = false, mmb_down = false;
-GLint x_offset = 0, y_offset = 0;
-GLint prev_x = 0, prev_y = 0;
 
-GLfloat COLOR_BLUE[] = {0, 0, 1};
-GLfloat COLOR_GREEN[] = {0, 1, 0};
-GLfloat COLOR_RED[] = {1, 0, 0};
-GLfloat COLOR_WHITE[] = {1, 1, 1};
-GLfloat COLOR_BLACK[] = {0, 0, 0};
-GLfloat COLOR_GREY[] = {0.2, 0.2, 0.2};
+std::atomic_bool needsRedraw{true}, generationPaused{false};
+std::mutex liveCellsLock;
+bool workerShutdown = false;
+
+struct TickCountState {
+    GLint maxFrameRate = 1'000 / targetFps, maxTickRate = 1'000 / targetFps;
+    GLint fps = 0, tps = 0;
+    GLdouble lastFrameTime = 0, lastTickTime = 0;
+    GLint frameCount = 0, tickCount = 0;
+    GLdouble frameTimeAccumulator = 0.0, tickTimeAccumulator = 0.0;
+} ticks;
+
+struct MouseState {
+    bool lmbDown{}, mmbDown{};
+} mouseState;
+
+struct DrawState {
+    GLint prevDrawX{}, prevDrawY{};
+} drawState;
+
+struct GridMoveState {
+    GLint xOffset{}, yOffset{};
+    GLint prevX{}, prevY{};
+} gridMoveState;
 
 struct Coords {
     const int x;
@@ -38,61 +57,60 @@ struct Coords {
 
 struct CoordsHash {
     std::size_t operator()(const Coords &coords) const {
-        return std::hash<int>()(coords.x) ^ (std::hash<int>()(coords.y) << 1);
+        int h = coords.x ^ (coords.y * 0x9e3779b9);
+        return h ^ (h >> 16);
     }
 };
 
-std::unordered_set<Coords, CoordsHash> living_cells;
+std::unordered_set<Coords, CoordsHash> livingCells;
 
-std::vector<Coords> get_neighbors(const Coords cell) {
-    // dead + 3 live = live
-    // live + 2/3 live = live
-    // else dead
-    std::vector<Coords> neighbors;
-
-    for (int x = -1; x <= 1; x++) {
-        for (int y = -1; y <= 1; y++) {
-            if (x == 0 && y == 0)
-                continue;
-
-            neighbors.push_back({cell.x + x, cell.y + y});
+inline std::array<Coords, 8> getNeighbors(const Coords &cell) {
+    return {
+        {
+            {cell.x - 1, cell.y - 1},
+            {cell.x - 1, cell.y},
+            {cell.x - 1, cell.y + 1},
+            {cell.x, cell.y - 1},
+            {cell.x, cell.y + 1},
+            {cell.x + 1, cell.y - 1},
+            {cell.x + 1, cell.y},
+            {cell.x + 1, cell.y + 1},
         }
-    }
-
-    return neighbors;
+    };
 }
 
-void next_generation() {
-    std::unordered_set<Coords, CoordsHash> next_gen;
-    std::unordered_map<Coords, int, CoordsHash> deadToAliveNeighbors;
+void nextGeneration() {
+    std::unordered_set<Coords, CoordsHash> nextGen;
+    std::unordered_map<Coords, int, CoordsHash> deadToAliveNeighbors(livingCells.size());
 
-    for (auto &cell: living_cells) {
-        auto neighbors = get_neighbors(cell);
+    for (auto &cell: livingCells) {
+        auto neighbors = getNeighbors(cell);
 
-        std::vector<Coords> deadNeighbors;
-        std::ranges::copy_if(neighbors, std::back_inserter(deadNeighbors), [](const Coords &coord) {
-            return !living_cells.contains(coord);
-        });
-
-        for (auto &dead: deadNeighbors) {
-            deadToAliveNeighbors.try_emplace(dead, 0);
-            auto &aliveNeighborCount = deadToAliveNeighbors[dead];
-            ++aliveNeighborCount;
+        int deadNeighborCount = 0;
+        for (auto &neighbor: neighbors) {
+            if (!livingCells.contains(neighbor)) {
+                ++deadNeighborCount;
+                auto &aliveNeighborCount = deadToAliveNeighbors[neighbor];
+                ++aliveNeighborCount;
+            }
         }
 
-        int aliveNeighborCount = neighbors.size() - deadNeighbors.size();
+        int aliveNeighborCount = neighbors.size() - deadNeighborCount;
         if (aliveNeighborCount == 2 || aliveNeighborCount == 3) {
-            next_gen.insert(cell);
+            nextGen.insert(cell);
         }
     }
 
     for (const auto &[deadCell, aliveNeighborCount]: deadToAliveNeighbors) {
         if (aliveNeighborCount == 3) {
-            next_gen.insert(deadCell);
+            nextGen.insert(deadCell);
         }
     }
 
-    living_cells.swap(next_gen);
+    while (!liveCellsLock.try_lock());
+    livingCells.swap(nextGen);
+    needsRedraw.store(true);
+    liveCellsLock.unlock();
 }
 
 void drawSquare(float x, float y, float size) {
@@ -104,92 +122,80 @@ void drawSquare(float x, float y, float size) {
     glEnd();
 }
 
+void updateTitle() {
+    auto base = std::string("Conway's Game of Life");
+    if (generationPaused.load()) base += " | PAUSED | ";
+    base += " FPS: " + std::to_string(ticks.fps);
+    base += " TPS: " + std::to_string(ticks.tps);
+    glutSetWindowTitle(base.c_str());
+}
 
 void display() {
     glClear(GL_COLOR_BUFFER_BIT);
-    const int rows = wh / cell_size + 1, cols = ww / cell_size + 1;
 
-    glColor3fv(COLOR_BLACK);
-    for (int row = 0; row < rows; row++) {
-        for (int col = 0; col < cols; col++) {
-            GLint drawX = col * cell_size, drawY = row * cell_size;
-
-            if (!living_cells.contains({drawX, drawY}))
-                drawSquare(drawX + x_offset, drawY + y_offset, cell_size);
-        }
-    }
-
-    if (!living_cells.empty()) {
+    while (!liveCellsLock.try_lock());
+    if (!livingCells.empty()) {
         glColor3fv(COLOR_BLUE);
-        for (const auto &[x, y]: living_cells) {
-            GLint drawX = y * cell_size, drawY = x * cell_size;
-            drawSquare(drawX + x_offset, drawY + y_offset, cell_size);
+        for (const auto &[x, y]: livingCells) {
+            drawSquare(x * cellSize + gridMoveState.xOffset, y * cellSize + gridMoveState.yOffset, cellSize);
         }
     }
+    std::cout << livingCells.size() << std::endl;
+    liveCellsLock.unlock();
 
     glutSwapBuffers();
+    ++ticks.frameCount;
 }
-
-void init() {
-    glClearColor(0, 0, 0, 1);
-
-    glMatrixMode(GL_PROJECTION);
-    // glLoadIdentity();
-    glOrtho(0, ww, 0, wh, -1, 1);
-    // glMatrixMode(GL_MODELVIEW);
-}
-
 
 void idle() {
-    const int currentTime = glutGet(GLUT_ELAPSED_TIME);
-    if (paused) {
-        glutSetWindowTitle("Conway's Game of Life (paused)");
-    } else {
-        glutSetWindowTitle("Conway's Game of Life");
-    }
-    if (const int deltaTime = currentTime - lastTick; deltaTime >= tickRate) {
-        if (!paused) {
-            next_generation();
-        }
+    if (needsRedraw.load()) {
+        needsRedraw.store(false);
         glutPostRedisplay();
+    }
 
-        lastTick = glutGet(GLUT_ELAPSED_TIME);
+    int currentTime = glutGet(GLUT_ELAPSED_TIME);
+    if (const int deltaTime = currentTime - ticks.lastFrameTime; deltaTime >= ticks.maxFrameRate) {
+        ticks.frameTimeAccumulator += deltaTime;
+        if (ticks.frameTimeAccumulator >= 1000) {
+            ticks.fps = ticks.frameCount;
+
+            ticks.frameTimeAccumulator = 0.0;
+            ticks.frameCount = 0;
+        }
+        ticks.lastFrameTime = currentTime;
     }
 }
 
 std::optional<Coords> getClickCell(int x, int y) {
-    int row = y / cell_size, col = x / cell_size;
-    return {{row, col}};
-}
-
-void restartGame() {
-    // x_offset = y_offset = 0;
-    // cell_size = 50;
-    living_cells.clear();
-    living_cells.insert({5, 5});
-    living_cells.insert({4, 5});
-    living_cells.insert({4, 6});
-    living_cells.insert({4, 7});
-    living_cells.insert({4, 8});
-}
-
-void keybinds(unsigned char key, int _x, int _y) {
-    if (key == 'p' || key == 'P') {
-        paused = !paused;
-    }
-
-    if (key == 'r' || key == 'R') {
-        restartGame();
-    }
+    return {{x / cellSize, y / cellSize}};
 }
 
 void placeLiveCell(int x, int y) {
-    x -= x_offset, y -= y_offset;
+    x -= gridMoveState.xOffset, y -= gridMoveState.yOffset;
     auto cell = getClickCell(x, y);
     if (cell.has_value()) {
-        std::cout << "Placing at (" << cell.value().x << "," << cell.value().y << ")" << std::endl;
-        living_cells.insert({cell.value().x, cell.value().y});
+        while (!liveCellsLock.try_lock());
+        livingCells.insert({cell.value().x, cell.value().y});
+        needsRedraw.store(true);
+        liveCellsLock.unlock();
     }
+}
+
+void restartGame() {
+    while (liveCellsLock.try_lock());
+    gridMoveState = {};
+    livingCells.clear();
+    livingCells.insert({ww / cellSize / 2 + 0, wh / cellSize / 2 + 0});
+    livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 0});
+    livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 1});
+    livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 2});
+    livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 3});
+    needsRedraw.store(true);
+    liveCellsLock.unlock();
+}
+
+void togglePause() {
+    generationPaused.store(!generationPaused.load());
 }
 
 void mouseClick(int button, int state, int x, int y) {
@@ -200,37 +206,139 @@ void mouseClick(int button, int state, int x, int y) {
         if (state == GLUT_UP) {
             placeLiveCell(x, y);
         }
-        lmb_down = state == GLUT_DOWN;
+
+        mouseState.lmbDown = state == GLUT_DOWN;
+        drawState.prevDrawX = x, drawState.prevDrawY = y;
     } else if (button == GLUT_MIDDLE_BUTTON) {
         if (state == GLUT_DOWN) {
-            mmb_down = true;
-            prev_x = x, prev_y = y;
-            prev_paused_state = paused;
-            paused = true;
+            mouseState.mmbDown = true;
+            gridMoveState.prevX = x, gridMoveState.prevY = y;
         }
         if (state == GLUT_UP) {
-            mmb_down = false;
-            paused = prev_paused_state;
+            mouseState.mmbDown = false;
         }
-    } else if (button == WHEEL_UP) {
-        ++cell_size;
-    } else if (button == WHEEL_DOWN) {
-        cell_size = std::max(1, cell_size - 1);
+    } else if (button == WHEEL_UP || button == WHEEL_DOWN) {
+        // Adjust offsets based on mouse position
+        int mouseWorldX = (x - gridMoveState.xOffset) / cellSize;
+        int mouseWorldY = (y - gridMoveState.yOffset) / cellSize;
+
+        cellSize = button == WHEEL_UP ? cellSize + 2 : std::max(cellSize - 2, 2);
+
+        gridMoveState.xOffset = x - mouseWorldX * cellSize;
+        gridMoveState.yOffset = y - mouseWorldY * cellSize;
+
+        needsRedraw.store(true);
     }
 }
-
 
 void mouseHover(int x, int y) {
     y = wh - y;
 
-    if (lmb_down) {
-        placeLiveCell(x, y);
-    } else if (mmb_down) {
-        x_offset += x - prev_x;
-        y_offset += y - prev_y;
+    if (mouseState.lmbDown) {
+        for (auto &[x, y]: generateLine<Coords>(drawState.prevDrawX, drawState.prevDrawY, x, y)) {
+            placeLiveCell(x, y);
+        }
+        drawState.prevDrawX = x, drawState.prevDrawY = y;
+    } else if (mouseState.mmbDown) {
+        gridMoveState.xOffset += x - gridMoveState.prevX;
+        gridMoveState.yOffset += y - gridMoveState.prevY;
 
-        prev_x = x, prev_y = y;
+        gridMoveState.prevX = x, gridMoveState.prevY = y;
+        needsRedraw.store(true);
     }
+}
+
+void fps_menu(int code) {
+    switch (code) {
+        case 0:
+            targetFps = 1;
+            break;
+        case 1:
+            targetFps = 4;
+            break;
+        case 2:
+            targetFps = 10;
+            break;
+        case 3:
+            targetFps = 24;
+            break;
+        case 4:
+            targetFps = 60;
+            break;
+        case 5:
+            targetFps = 144;
+            break;
+        default:
+            std::cerr << "Unrecognized menu command" << std::endl;
+    }
+
+    ticks.maxTickRate = 1'000 / targetFps;
+    ticks.maxFrameRate = 1'000 / targetFps;
+}
+
+void main_menu(int code) {
+    if (code == 0) {
+        togglePause();
+        if (generationPaused.load()) {
+            glutChangeToMenuEntry(1, "> Play", 0);
+        } else {
+            glutChangeToMenuEntry(1, "|| Pause", 0);
+        }
+    }
+}
+
+void createMenus() {
+    int fpsMenuEntry = glutCreateMenu(fps_menu);
+    glutAddMenuEntry("1 FPS", 0);
+    glutAddMenuEntry("4 FPS", 1);
+    glutAddMenuEntry("10 FPS", 2);
+    glutAddMenuEntry("24 FPS", 3);
+    glutAddMenuEntry("60 FPS", 4);
+    glutAddMenuEntry("144 FPS", 5);
+    glutCreateMenu(main_menu);
+    glutAddMenuEntry("|| Pause", 0);
+    glutAddSubMenu("Target FPS", fpsMenuEntry);
+    glutAttachMenu(GLUT_RIGHT_BUTTON);
+}
+
+void keyUps(unsigned char key, int x, int y) {
+    if (key == 'p' || key == 'P') {
+        main_menu(0);
+    } else if (key == 'r' || key == 'R') {
+        restartGame();
+    }
+}
+
+void init() {
+    glClearColor(0, 0, 0, 1);
+
+    glMatrixMode(GL_PROJECTION);
+    glOrtho(0, ww, 0, wh, -1, 1);
+}
+
+void workerRun() {
+    while (!workerShutdown) {
+        int currentTime = glutGet(GLUT_ELAPSED_TIME);
+        if (const int deltaTime = currentTime - ticks.lastTickTime; deltaTime >= ticks.maxTickRate) {
+            if (!generationPaused.load()) nextGeneration();
+
+            updateTitle();
+            ++ticks.tickCount;
+            ticks.tickTimeAccumulator += deltaTime;
+            if (ticks.tickTimeAccumulator >= 1000) {
+                ticks.tps = ticks.tickCount;
+
+                ticks.tickTimeAccumulator = 0.0;
+                ticks.tickCount = 0;
+            }
+
+            ticks.lastTickTime = glutGet(GLUT_ELAPSED_TIME);
+        }
+    }
+}
+
+void cleanup() {
+    workerShutdown = true;
 }
 
 int main(int argc, char **argv) {
@@ -241,14 +349,23 @@ int main(int argc, char **argv) {
 
     glutInitWindowSize(ww, wh);
     glutInitWindowPosition((glutGet(GLUT_SCREEN_WIDTH) - ww) / 2, (glutGet(GLUT_SCREEN_HEIGHT) - wh) / 2);
-    glutCreateWindow("Conway's Game of Life");
+    glutCreateWindow("");
     restartGame();
 
     init();
     glutDisplayFunc(display);
     glutIdleFunc(idle);
+
     glutMouseFunc(mouseClick);
     glutMotionFunc(mouseHover);
-    glutKeyboardFunc(keybinds);
+
+    glutKeyboardUpFunc(keyUps);
+    createMenus();
+
+    glutCloseFunc(cleanup);
+    glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_GLUTMAINLOOP_RETURNS);
+
+    std::thread nextGenerator(workerRun);
     glutMainLoop();
+    nextGenerator.join();
 }

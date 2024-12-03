@@ -19,16 +19,12 @@
 #include "conwayutils.h"
 #include "GL/freeglut_ext.h"
 
-int cellSize = 50, targetFps = 10;
+int cellSize = 50, targetFps = 1;
 int ww, wh;
 
 std::atomic_bool generationPaused{false};
-std::mutex liveCellsLock, userInputLock;
-
-int prevMouseX, prevMouseY;
-
-bool workerShutdown = false;
-bool needsRedraw = false;
+std::mutex livingCellsLock, userInputLock;
+volatile bool needsRedraw = false, workerShutdown = false, restartRequested = false;
 
 struct TickCountState {
     int fps = 0, tps = 0;
@@ -40,7 +36,13 @@ struct TickCountState {
 
 struct MouseState {
     bool lmbDown{}, mmbDown{};
+    int prevMouseX{}, prevMouseY{};
 } mouseState;
+
+struct KeyboardState {
+    bool wDown{}, aDown{}, sDown{}, dDown{};
+    int lastMoveTimeStamp = 0;
+} keyboardState;
 
 struct CursorDrawState {
     int prevDrawX{}, prevDrawY{};
@@ -69,7 +71,7 @@ void display() {
     // cursor shadow
     if (!mouseState.mmbDown) {
         glColor3fv(COLOR_GREY);
-        auto [shadowX, shadowY] = mouseToWorldCoords(prevMouseX, prevMouseY,
+        auto [shadowX, shadowY] = mouseToWorldCoords(mouseState.prevMouseX, mouseState.prevMouseY,
                                                      gridMoveState.xOffset, gridMoveState.yOffset);
         auto [shadowCellX, shadowCellY] = worldCoordsToCell(shadowX, shadowY, cellSize);
         drawSquare(shadowCellX * cellSize + gridMoveState.xOffset,
@@ -85,6 +87,21 @@ void display() {
     }
 
     glutSwapBuffers();
+    ++ticks.frameCount;
+}
+
+void moveWithKeys() {
+    int currMoveTimestamp = glutGet(GLUT_ELAPSED_TIME);
+    if (currMoveTimestamp - keyboardState.lastMoveTimeStamp >= 25) {
+        int xMove = 0, yMove = 0;
+        if (keyboardState.wDown) yMove -= 1;
+        if (keyboardState.aDown) xMove += 1;
+        if (keyboardState.sDown) yMove += 1;
+        if (keyboardState.dDown) xMove -= 1;
+        gridMoveState.xOffset += 32 * xMove, gridMoveState.yOffset += 32 * yMove;
+        keyboardState.lastMoveTimeStamp = currMoveTimestamp;
+        if (xMove != 0 || yMove != 0) needsRedraw = true;
+    }
 }
 
 void idle() {
@@ -92,15 +109,16 @@ void idle() {
         std::chrono::high_resolution_clock::now().time_since_epoch()).count();
     bool frameDrawn = false;
 
+    moveWithKeys();
+
     // urgent redraw for responsiveness (ignores fps cap)
-    while (!liveCellsLock.try_lock());
+    while (!livingCellsLock.try_lock());
     if (needsRedraw) {
         display();
         needsRedraw = false;
         frameDrawn = true;
-        ++ticks.frameCount;
     }
-    liveCellsLock.unlock();
+    livingCellsLock.unlock();
 
     if (auto deltaTime = currentTime - ticks.lastFrameTime; deltaTime >= ticks.maxFrameRate) {
         ticks.frameTimeAccumulator += deltaTime;
@@ -110,13 +128,14 @@ void idle() {
             ticks.frameTimeAccumulator = 0.0;
             ticks.frameCount = 0;
         }
-        ticks.lastFrameTime = currentTime;
-        while (!liveCellsLock.try_lock());
+        while (!livingCellsLock.try_lock());
         if (!generationPaused.load() && !frameDrawn) {
             display();
-            ++ticks.frameCount;
+            needsRedraw = false;
         }
-        liveCellsLock.unlock();
+        livingCellsLock.unlock();
+
+        ticks.lastFrameTime = currentTime;
     }
 }
 
@@ -126,21 +145,9 @@ void bufferUserInput(int x_mouse, int y_mouse) {
     userAddedCells.push_back(worldCoordsToCell(x, y, cellSize));
 }
 
-void restartGame() {
-    while (liveCellsLock.try_lock());
-    gridMoveState = {};
-    livingCells.clear();
-    livingCells.insert({ww / cellSize / 2 + 0, wh / cellSize / 2 + 0});
-    livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 0});
-    livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 1});
-    livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 2});
-    livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 3});
-    liveCellsLock.unlock();
-    needsRedraw = true;
-}
-
 void togglePause() {
     generationPaused.store(!generationPaused.load());
+    needsRedraw = true;
 }
 
 void mouseClick(int button, int state, int x, int y) {
@@ -181,7 +188,7 @@ void mouseClick(int button, int state, int x, int y) {
 
 void mouseHoverButtonPressed(int x, int y) {
     y = wh - y;
-    prevMouseX = x, prevMouseY = y;
+    mouseState.prevMouseX = x, mouseState.prevMouseY = y;
 
     if (mouseState.lmbDown) {
         auto line = generateLine(drawState.prevDrawX, drawState.prevDrawY, x, y);
@@ -202,7 +209,7 @@ void mouseHoverButtonPressed(int x, int y) {
 
 void mouseHoverNoButton(int x, int y) {
     y = wh - y;
-    prevMouseX = x, prevMouseY = y;
+    mouseState.prevMouseX = x, mouseState.prevMouseY = y;
     needsRedraw = true;
 }
 
@@ -259,17 +266,37 @@ void createMenus() {
     glutAttachMenu(GLUT_RIGHT_BUTTON);
 }
 
+void keyDowns(unsigned char key, int x, int y) {
+    if (key == 'w' || key == 'W') {
+        keyboardState.wDown = true;
+    } else if (key == 'a' || key == 'A') {
+        keyboardState.aDown = true;
+    } else if (key == 's' || key == 'S') {
+        keyboardState.sDown = true;
+    } else if (key == 'd' || key == 'D') {
+        keyboardState.dDown = true;
+    }
+}
+
 void keyUps(unsigned char key, int x, int y) {
-    if (key == 'p' || key == 'P') {
+    if (key == 'w' || key == 'W') {
+        keyboardState.wDown = false;
+    } else if (key == 'a' || key == 'A') {
+        keyboardState.aDown = false;
+    } else if (key == 's' || key == 'S') {
+        keyboardState.sDown = false;
+    } else if (key == 'd' || key == 'D') {
+        keyboardState.dDown = false;
+    } else if (key == 'p' || key == 'P') {
         mainMenu(0);
     } else if (key == 'r' || key == 'R') {
-        restartGame();
+        restartRequested = true;
     }
 }
 
 void nextGeneration() {
-    std::unordered_set<Coords, CoordsHash> nextGen;
-    std::unordered_map<Coords, int, CoordsHash> deadToAliveNeighbors;
+    std::unordered_set<Coords, CoordsHash> nextGen(livingCells.size());
+    std::unordered_map<Coords, int, CoordsHash> deadToAliveNeighbors(2 * livingCells.size());
 
     for (auto &cell: livingCells) {
         auto neighbors = getNeighbors(cell);
@@ -295,9 +322,22 @@ void nextGeneration() {
         }
     }
 
-    while (!liveCellsLock.try_lock());
+    while (!livingCellsLock.try_lock());
     livingCells.swap(nextGen);
-    liveCellsLock.unlock();
+    livingCellsLock.unlock();
+}
+
+void restartGame() {
+    while (!livingCellsLock.try_lock());
+    livingCells.clear();
+    livingCells.insert({0, 0});
+    livingCells.insert({-1, 0});
+    livingCells.insert({-1, 1});
+    livingCells.insert({-1, 2});
+    livingCells.insert({-1, 3});
+    restartRequested = false;
+    needsRedraw = true;
+    livingCellsLock.unlock();
 }
 
 void workerRun() {
@@ -307,16 +347,19 @@ void workerRun() {
         userAddedCells.clear();
         userInputLock.unlock();
 
+        if (workerShutdown) return;
+        updateTitle();
+        if (restartRequested) restartGame();
+
         int64_t currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::high_resolution_clock::now().time_since_epoch()).count();
         if (const auto deltaTime = currentTime - ticks.lastTickTime; deltaTime >= ticks.maxTickRate) {
-            if (workerShutdown) return;
-            if (!generationPaused.load()) nextGeneration();
+            if (!generationPaused.load()) {
+                nextGeneration();
+                needsRedraw = true;
+                ++ticks.tickCount;
+            }
 
-            if (workerShutdown) return;
-            updateTitle();
-
-            ++ticks.tickCount;
             ticks.tickTimeAccumulator += deltaTime;
             if (deltaTime >= 1000 || ticks.tickTimeAccumulator >= 1000) {
                 ticks.tps = ticks.tickCount;
@@ -332,7 +375,6 @@ void workerRun() {
 
 void init() {
     glClearColor(0, 0, 0, 1);
-
     glMatrixMode(GL_PROJECTION);
     glOrtho(0, ww, 0, wh, -1, 1);
 }
@@ -342,33 +384,35 @@ void cleanup() {
 }
 
 int main(int argc, char **argv) {
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
     glutInit(&argc, argv);
-    ww = 100 * glutGet(GLUT_SCREEN_WIDTH) / 141;
-    wh = 100 * glutGet(GLUT_SCREEN_HEIGHT) / 141;
+    ww = 100 * glutGet(GLUT_SCREEN_WIDTH) / 141, wh = 100 * glutGet(GLUT_SCREEN_HEIGHT) / 141;
+    gridMoveState.xOffset = ww / 2, gridMoveState.yOffset = wh / 2;
 
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
     glutInitWindowSize(ww, wh);
     glutInitWindowPosition((glutGet(GLUT_SCREEN_WIDTH) - ww) / 2, (glutGet(GLUT_SCREEN_HEIGHT) - wh) / 2);
     glutCreateWindow("");
-    restartGame();
 
     init();
     glutDisplayFunc(display);
     glutIdleFunc(idle);
 
+    // User Input
     glutMouseFunc(mouseClick);
     glutMotionFunc(mouseHoverButtonPressed);
     glutPassiveMotionFunc(mouseHoverNoButton);
-
+    glutKeyboardFunc(keyDowns);
     glutKeyboardUpFunc(keyUps);
     createMenus();
 
-    glutCloseFunc(cleanup);
+    // Cleanup
     glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_GLUTMAINLOOP_RETURNS);
+    glutCloseFunc(cleanup);
 
+    restartGame();
     std::thread nextGenerator(workerRun);
-    glColor3fv(COLOR_BLUE);
     glutMainLoop();
+
     nextGenerator.join();
     std::cout << "Bye!" << std::endl;
 }

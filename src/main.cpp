@@ -23,6 +23,10 @@ int cellSize = 50, targetFps = 1;
 int ww, wh;
 
 std::atomic_bool generationPaused{false};
+/*
+ * Caveats:
+ *  - only worker thread can modify livingCells
+ */
 std::mutex livingCellsLock, userInputLock;
 volatile bool needsRedraw = false, workerShutdown = false, restartRequested = false;
 

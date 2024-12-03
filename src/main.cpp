@@ -18,19 +18,23 @@
 #include "conwayutils.h"
 #include "GL/freeglut_ext.h"
 
-GLint cellSize = 50, targetFps = 10;
-GLint ww, wh;
+int cellSize = 50, targetFps = 10;
+int ww, wh;
 
-std::atomic_bool needsRedraw{true}, generationPaused{false};
-std::mutex liveCellsLock;
+std::atomic_bool generationPaused{false};
+std::mutex liveCellsLock, userInputLock;
+
+int prevMouseX, prevMouseY;
+
 bool workerShutdown = false;
+bool needsRedraw = false;
 
 struct TickCountState {
-    GLint maxFrameRate = 1'000 / targetFps, maxTickRate = 1'000 / targetFps;
-    GLint fps = 0, tps = 0;
-    GLdouble lastFrameTime = 0, lastTickTime = 0;
-    GLint frameCount = 0, tickCount = 0;
-    GLdouble frameTimeAccumulator = 0.0, tickTimeAccumulator = 0.0;
+    float maxFrameRate = 1000.0f / targetFps, maxTickRate = 1000.0f / targetFps;
+    int fps = 0, tps = 0;
+    int lastFrameTime = 0, lastTickTime = 0;
+    int frameCount = 0, tickCount = 0;
+    int frameTimeAccumulator = 0.0, tickTimeAccumulator = 0.0;
 } ticks;
 
 struct MouseState {
@@ -38,12 +42,14 @@ struct MouseState {
 } mouseState;
 
 struct DrawState {
-    GLint prevDrawX{}, prevDrawY{};
+    // continuous line from previous point to next when dragging the "pencil"
+    int prevDrawX{}, prevDrawY{};
 } drawState;
 
 struct GridMoveState {
-    GLint xOffset{}, yOffset{};
-    GLint prevX{}, prevY{};
+    // game board panning
+    int xOffset{}, yOffset{};
+    int prevX{}, prevY{};
 } gridMoveState;
 
 struct Coords {
@@ -58,11 +64,21 @@ struct Coords {
 struct CoordsHash {
     std::size_t operator()(const Coords &coords) const {
         int h = coords.x ^ (coords.y * 0x9e3779b9);
-        return h ^ (h >> 16);
+        return h ^ h >> 16;
     }
 };
 
 std::unordered_set<Coords, CoordsHash> livingCells;
+std::vector<Coords> userAdded;
+
+
+Coords mouseToWorldCoordinates(int x, int y) {
+    return {
+        x / cellSize * cellSize - gridMoveState.xOffset,
+        y / cellSize * cellSize - gridMoveState.yOffset
+    };
+}
+
 
 inline std::array<Coords, 8> getNeighbors(const Coords &cell) {
     return {
@@ -81,7 +97,7 @@ inline std::array<Coords, 8> getNeighbors(const Coords &cell) {
 
 void nextGeneration() {
     std::unordered_set<Coords, CoordsHash> nextGen;
-    std::unordered_map<Coords, int, CoordsHash> deadToAliveNeighbors(livingCells.size());
+    std::unordered_map<Coords, int, CoordsHash> deadToAliveNeighbors;
 
     for (auto &cell: livingCells) {
         auto neighbors = getNeighbors(cell);
@@ -109,7 +125,6 @@ void nextGeneration() {
 
     while (!liveCellsLock.try_lock());
     livingCells.swap(nextGen);
-    needsRedraw.store(true);
     liveCellsLock.unlock();
 }
 
@@ -133,27 +148,31 @@ void updateTitle() {
 void display() {
     glClear(GL_COLOR_BUFFER_BIT);
 
-    while (!liveCellsLock.try_lock());
-    if (!livingCells.empty()) {
-        glColor3fv(COLOR_BLUE);
-        for (const auto &[x, y]: livingCells) {
-            drawSquare(x * cellSize + gridMoveState.xOffset, y * cellSize + gridMoveState.yOffset, cellSize);
-        }
+    glColor3fv(COLOR_GREY);
+    auto [mouseShadowX, mouseShadowY] = mouseToWorldCoordinates(prevMouseX, prevMouseY);
+    drawSquare(mouseShadowX / cellSize * cellSize + gridMoveState.xOffset,
+               mouseShadowY / cellSize * cellSize + gridMoveState.yOffset,
+               cellSize);
+
+    glColor3fv(COLOR_BLUE);
+    for (const auto &[x, y]: livingCells) {
+        drawSquare(x * cellSize + gridMoveState.xOffset, y * cellSize + gridMoveState.yOffset, cellSize);
     }
-    std::cout << livingCells.size() << std::endl;
-    liveCellsLock.unlock();
 
     glutSwapBuffers();
-    ++ticks.frameCount;
 }
 
 void idle() {
-    if (needsRedraw.load()) {
-        needsRedraw.store(false);
-        glutPostRedisplay();
+    std::cout << prevMouseX << " " << prevMouseY << std::endl;
+    int currentTime = glutGet(GLUT_ELAPSED_TIME);
+    bool frameDrawn = false;
+
+    if (needsRedraw) {
+        display();
+        needsRedraw = false;
+        frameDrawn = true;
     }
 
-    int currentTime = glutGet(GLUT_ELAPSED_TIME);
     if (const int deltaTime = currentTime - ticks.lastFrameTime; deltaTime >= ticks.maxFrameRate) {
         ticks.frameTimeAccumulator += deltaTime;
         if (ticks.frameTimeAccumulator >= 1000) {
@@ -163,6 +182,15 @@ void idle() {
             ticks.frameCount = 0;
         }
         ticks.lastFrameTime = currentTime;
+        while (!liveCellsLock.try_lock());
+        // if (needsRedraw.load()) {
+        if (!generationPaused.load() && !frameDrawn) {
+            display();
+        }
+        if (!generationPaused.load()) {
+            ++ticks.frameCount;
+        }
+        liveCellsLock.unlock();
     }
 }
 
@@ -170,16 +198,12 @@ std::optional<Coords> getClickCell(int x, int y) {
     return {{x / cellSize, y / cellSize}};
 }
 
-void placeLiveCell(int x, int y) {
-    x -= gridMoveState.xOffset, y -= gridMoveState.yOffset;
+void bufferUserInput(int x_mouse, int y_mouse) {
+    auto [x, y] = mouseToWorldCoordinates(x_mouse, y_mouse);
     auto cell = getClickCell(x, y);
-    if (cell.has_value()) {
-        while (!liveCellsLock.try_lock());
-        livingCells.insert({cell.value().x, cell.value().y});
-        needsRedraw.store(true);
-        liveCellsLock.unlock();
-    }
+    if (cell.has_value()) userAdded.push_back({cell.value().x, cell.value().y});
 }
+
 
 void restartGame() {
     while (liveCellsLock.try_lock());
@@ -190,8 +214,8 @@ void restartGame() {
     livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 1});
     livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 2});
     livingCells.insert({ww / cellSize / 2 + -1, wh / cellSize / 2 + 3});
-    needsRedraw.store(true);
     liveCellsLock.unlock();
+    needsRedraw = true;
 }
 
 void togglePause() {
@@ -204,11 +228,15 @@ void mouseClick(int button, int state, int x, int y) {
 
     if (button == GLUT_LEFT_BUTTON) {
         if (state == GLUT_UP) {
-            placeLiveCell(x, y);
+            mouseState.lmbDown = false;
+            while (!userInputLock.try_lock());
+            bufferUserInput(x, y);
+            userInputLock.unlock();
+            needsRedraw = true;
+        } else {
+            mouseState.lmbDown = true;
+            drawState.prevDrawX = x, drawState.prevDrawY = y;
         }
-
-        mouseState.lmbDown = state == GLUT_DOWN;
-        drawState.prevDrawX = x, drawState.prevDrawY = y;
     } else if (button == GLUT_MIDDLE_BUTTON) {
         if (state == GLUT_DOWN) {
             mouseState.mmbDown = true;
@@ -226,25 +254,27 @@ void mouseClick(int button, int state, int x, int y) {
 
         gridMoveState.xOffset = x - mouseWorldX * cellSize;
         gridMoveState.yOffset = y - mouseWorldY * cellSize;
-
-        needsRedraw.store(true);
+        needsRedraw = true;
     }
 }
 
-void mouseHover(int x, int y) {
+void mouseHoverButtonPressed(int x, int y) {
     y = wh - y;
 
     if (mouseState.lmbDown) {
-        for (auto &[x, y]: generateLine<Coords>(drawState.prevDrawX, drawState.prevDrawY, x, y)) {
-            placeLiveCell(x, y);
-        }
+        auto line = generateLine<Coords>(drawState.prevDrawX, drawState.prevDrawY, x, y);
+
+        while (!userInputLock.try_lock());
+        for (auto &[x, y]: line) bufferUserInput(x, y);
+        userInputLock.unlock();
+        needsRedraw = true;
         drawState.prevDrawX = x, drawState.prevDrawY = y;
     } else if (mouseState.mmbDown) {
         gridMoveState.xOffset += x - gridMoveState.prevX;
         gridMoveState.yOffset += y - gridMoveState.prevY;
 
         gridMoveState.prevX = x, gridMoveState.prevY = y;
-        needsRedraw.store(true);
+        needsRedraw = true;
     }
 }
 
@@ -272,8 +302,8 @@ void fps_menu(int code) {
             std::cerr << "Unrecognized menu command" << std::endl;
     }
 
-    ticks.maxTickRate = 1'000 / targetFps;
-    ticks.maxFrameRate = 1'000 / targetFps;
+    ticks.maxTickRate = 1000.0f / targetFps;
+    ticks.maxFrameRate = 1000.0f / targetFps;
 }
 
 void main_menu(int code) {
@@ -319,10 +349,19 @@ void init() {
 void workerRun() {
     while (!workerShutdown) {
         int currentTime = glutGet(GLUT_ELAPSED_TIME);
+
+        while (!userInputLock.try_lock());
+        livingCells.insert(userAdded.begin(), userAdded.end());
+        userAdded.clear();
+        userInputLock.unlock();
+
         if (const int deltaTime = currentTime - ticks.lastTickTime; deltaTime >= ticks.maxTickRate) {
+            if (workerShutdown) return;
             if (!generationPaused.load()) nextGeneration();
 
+            if (workerShutdown) return;
             updateTitle();
+
             ++ticks.tickCount;
             ticks.tickTimeAccumulator += deltaTime;
             if (ticks.tickTimeAccumulator >= 1000) {
@@ -341,6 +380,12 @@ void cleanup() {
     workerShutdown = true;
 }
 
+void mouseHoverNoButton(int x, int y) {
+    y = wh - y;
+    prevMouseX = x, prevMouseY = y;
+    needsRedraw = true;
+}
+
 int main(int argc, char **argv) {
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
     glutInit(&argc, argv);
@@ -357,7 +402,8 @@ int main(int argc, char **argv) {
     glutIdleFunc(idle);
 
     glutMouseFunc(mouseClick);
-    glutMotionFunc(mouseHover);
+    glutMotionFunc(mouseHoverButtonPressed);
+    glutPassiveMotionFunc(mouseHoverNoButton);
 
     glutKeyboardUpFunc(keyUps);
     createMenus();
@@ -366,6 +412,8 @@ int main(int argc, char **argv) {
     glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_GLUTMAINLOOP_RETURNS);
 
     std::thread nextGenerator(workerRun);
+    glColor3fv(COLOR_BLUE);
     glutMainLoop();
     nextGenerator.join();
+    std::cout << "Bye!" << std::endl;
 }
